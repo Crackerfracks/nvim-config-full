@@ -1,0 +1,1099 @@
+-- ~/.config/nvim/lua/zk_follow_create.lua
+-- ZK wikilink follow-or-create with exact typed filenames (default), async prompts,
+-- blink.cmp provider (class-style .new()), template rendering, YAML frontmatter,
+-- backlink helpers, directory creation, create-without-follow, diagnostics refresh.
+-- Hardening: pure-Lua relpath, safe coroutine runner, blink ctx fallbacks, history picker fix.
+
+local M = {}
+
+-- -------------------------- CONFIG -----------------------------------
+M.cfg = {
+  backlink = { enabled = true, position = 'bottom', heading = 'Backlinks' },
+  autosave_created = true,
+  map_enter = true,
+  map_jumplist = true,
+  telescope_templates = true,
+  log_file = nil,
+  filename_mode = 'typed', -- 'typed' | 'slug' | 'zk'
+  id_prefix = false, -- only used in 'slug' mode
+  id_length = 4,
+  history_limit = 200,
+  refresh_source_strategy = 'write', -- 'write' | 'none'
+  preview = { enabled = true, max_lines = 40, border = 'rounded', width = 80 },
+}
+
+-- -------------------------- STATE ------------------------------------
+M._history = {}
+
+-- -------------------------- UTILS ------------------------------------
+local function trim(s)
+  return (s or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+local function slugify(s)
+  s = (s or ''):lower()
+  s = s:gsub('%s+', '-'):gsub('[^%w%-%_]', '-'):gsub('%-+', '-')
+  return s:gsub('^%-', ''):gsub('%-$', '')
+end
+local function random_id(n)
+  local alphabet = '0123456789abcdefghjkmnpqrstvwxyz'
+  local out = {}
+  for i = 1, n do
+    local idx = math.random(#alphabet)
+    out[i] = alphabet:sub(idx, idx)
+  end
+  return table.concat(out):sub(1, n)
+end
+local function get_first_h1_title(path)
+  local ok, lines = pcall(vim.fn.readfile, path, '', 50)
+  if not ok or not lines then
+    return nil
+  end
+  for _, l in ipairs(lines) do
+    local t = l:match '^#%s+(.+)'
+    if t then
+      return trim(t)
+    end
+  end
+  return nil
+end
+local function path_sep()
+  return package.config:sub(1, 1)
+end
+local function normalize_path(p)
+  local abs = vim.fn.fnamemodify(p, ':p')
+  if path_sep() == '\\' then
+    abs = abs:gsub('\\', '/')
+  end
+  return abs:gsub('/+$', '')
+end
+local function join_paths(...)
+  local sep = path_sep()
+  local parts = { ... }
+  for i, v in ipairs(parts) do
+    parts[i] = tostring(v or ''):gsub('[\\/]+$', '')
+  end
+  local joined = table.concat(parts, sep)
+  return normalize_path(joined)
+end
+local function dirname(p)
+  return vim.fn.fnamemodify(p, ':h')
+end
+local function basename(p)
+  return vim.fn.fnamemodify(p, ':t')
+end
+local function stem(p)
+  return vim.fn.fnamemodify(p, ':t:r')
+end
+local function without_ext(p)
+  return vim.fn.fnamemodify(p, ':r')
+end
+local function ensure_dir(p)
+  if p and vim.fn.isdirectory(p) == 0 then
+    vim.fn.mkdir(p, 'p')
+  end
+end
+local function feedkeys(keys)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', true)
+end
+
+-- pure-Lua relpath(base_dir, target_path)  -> always with forward slashes
+local function _split_slash(p)
+  local t = {}
+  p = (p or ''):gsub('\\', '/'):gsub('/+', '/')
+  for part in p:gmatch '[^/]+' do
+    t[#t + 1] = part
+  end
+  return t
+end
+local function relpath(base_dir, target_path)
+  local b = _split_slash(normalize_path(base_dir))
+  local t = _split_slash(normalize_path(target_path))
+  local i = 1
+  while i <= #b and i <= #t and b[i] == t[i] do
+    i = i + 1
+  end
+  local parts = {}
+  for _ = i, #b do
+    parts[#parts + 1] = '..'
+  end
+  for j = i, #t do
+    parts[#parts + 1] = t[j]
+  end
+  local rp = table.concat(parts, '/')
+  return rp == '' and '.' or rp
+end
+local function rel_wiki_path(from_dir, target_path)
+  return without_ext(relpath(from_dir, target_path))
+end
+
+local function find_notebook_root(abs_path)
+  local ok, util = pcall(require, 'zk.util')
+  if ok and util and util.notebook_root then
+    local root = util.notebook_root(abs_path)
+    if root and root ~= '' then
+      return root
+    end
+  end
+  if vim.env.ZK_NOTEBOOK_DIR and vim.fn.isdirectory(vim.env.ZK_NOTEBOOK_DIR) == 1 then
+    return vim.env.ZK_NOTEBOOK_DIR
+  end
+  local dir = vim.fn.fnamemodify(abs_path, ':p:h')
+  while dir and dir ~= path_sep() do
+    if vim.fn.isdirectory(join_paths(dir, '.zk')) == 1 then
+      return dir
+    end
+    dir = dirname(dir)
+  end
+  return nil
+end
+
+-- Parse [[...]] at cursor
+local function wikilink_at_cursor()
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  local line = vim.api.nvim_get_current_line()
+  for s, inner, e in line:gmatch '()%[%[([^%]]-)%]%]()' do
+    if col + 1 >= s and col + 1 <= e then
+      local target, alias = inner:match '^(.-)|(.+)$'
+      return { target = trim(target or inner), alias = alias and trim(alias) or nil }
+    end
+  end
+  return nil
+end
+
+-- Resolve target against current dir
+local function resolve_dir_and_basename(root, here_dir, target)
+  local composed = normalize_path(join_paths(normalize_path(here_dir), target))
+  local has_ext = composed:lower():sub(-3) == '.md'
+  local base = has_ext and stem(basename(composed)) or basename(composed)
+  local dir = dirname(composed)
+  local root_abs = normalize_path(root)
+  if dir:sub(1, #root_abs) ~= root_abs then
+    dir = root_abs
+  end
+  return dir, base, has_ext
+end
+
+-- Existing candidates: exact, then slug variants (local dir first, then whole notebook)
+local function find_existing(root, here_dir, target_no_anchor)
+  local dir, base = resolve_dir_and_basename(root, here_dir, target_no_anchor)
+  local matches = {}
+  local exact = normalize_path(join_paths(dir, base .. '.md'))
+  if vim.fn.filereadable(exact) == 1 then
+    matches[#matches + 1] = exact
+  end
+  if #matches == 0 then
+    local slug = slugify(base)
+    local function add(dirpath)
+      if vim.fn.isdirectory(dirpath) == 0 then
+        return
+      end
+      local pat1 = '**/*-' .. slug .. '.md'
+      local pat2 = '**/' .. slug .. '.md'
+      for _, p in ipairs(vim.fn.globpath(dirpath, pat1, false, true)) do
+        matches[#matches + 1] = p
+      end
+      for _, p in ipairs(vim.fn.globpath(dirpath, pat2, false, true)) do
+        matches[#matches + 1] = p
+      end
+    end
+    add(dir)
+    if #matches == 0 then
+      add(root)
+    end
+  end
+  local seen, uniq = {}, {}
+  for _, p in ipairs(matches) do
+    if not seen[p] then
+      uniq[#uniq + 1] = p
+      seen[p] = true
+    end
+  end
+  return uniq
+end
+
+-- ------------------ Async helpers (coroutine "await") -----------------
+local function co_run(fn)
+  local co = coroutine.create(fn)
+  local dead = false
+  local function step(...)
+    if dead then
+      return
+    end
+    local ok, yielded = coroutine.resume(co, ...)
+    if not ok then
+      dead = true
+      vim.schedule(function()
+        error(yielded)
+      end)
+      return
+    end
+    if coroutine.status(co) == 'dead' then
+      dead = true
+      return
+    end
+    -- expect a thunk(cb)
+    local thunk = yielded
+    if type(thunk) ~= 'function' then
+      dead = true
+      return
+    end
+    thunk(step)
+  end
+  step()
+end
+
+local function await_input(prompt, default)
+  return coroutine.yield(function(cont)
+    local called = false
+    local function once(v)
+      if called then
+        return
+      end
+      called = true
+      cont(v)
+    end
+    if vim.ui and vim.ui.input then
+      vim.ui.input({ prompt = prompt, default = default or '' }, function(v)
+        once(v or '')
+      end)
+    else
+      once(vim.fn.input(prompt, default or ''))
+    end
+  end)
+end
+
+local function await_select(items, opts)
+  return coroutine.yield(function(cont)
+    local called = false
+    local function once(v)
+      if called then
+        return
+      end
+      called = true
+      cont(v)
+    end
+
+    local used_telescope = false
+    if M.cfg.telescope_templates then
+      local ok, pickers = pcall(require, 'telescope.pickers')
+      if ok then
+        used_telescope = true
+        local finders = require 'telescope.finders'
+        local conf = require('telescope.config').values
+        local actions = require 'telescope.actions'
+        local action_state = require 'telescope.actions.state'
+        pickers
+          .new({}, {
+            prompt_title = (opts and opts.prompt) or 'Select',
+            finder = finders.new_table { results = items },
+            sorter = conf.generic_sorter {},
+            previewer = conf.file_previewer {},
+            attach_mappings = function(pb, _)
+              actions.select_default:replace(function()
+                local e = action_state.get_selected_entry()
+                actions.close(pb)
+                once(e and (e[1] or e.value or e))
+              end)
+              return true
+            end,
+          })
+          :find()
+      end
+    end
+    if not used_telescope then
+      if vim.ui and vim.ui.select then
+        vim.ui.select(items, opts or {}, function(item)
+          once(item)
+        end)
+      else
+        once(items[1])
+      end
+    end
+  end)
+end
+
+local function await_confirm(msg)
+  return coroutine.yield(function(c)
+    c(vim.fn.confirm(msg, '&Yes\n&No', 1) == 1)
+  end)
+end
+
+-- ------------------ Template + YAML + writing ------------------------
+local function render_template(lines, meta)
+  local s = table.concat(lines, '\n')
+  local rep = {
+    ['{{title}}'] = meta.title or '',
+    ['{{date}}'] = os.date(meta.date_fmt or '!%Y-%m-%d'),
+    ['{{id}}'] = meta.id or '',
+    ['{{content}}'] = meta.content or '',
+    ['{{tags}}'] = (meta.tags and #meta.tags > 0) and table.concat(meta.tags, ', ') or '',
+  }
+  for k, v in pairs(rep) do
+    s = s:gsub(k, v)
+  end
+  s = s:gsub('%s*$', '')
+  return vim.split(s, '\n')
+end
+
+local function list_templates(root)
+  local out, seen = {}, {}
+  local function add_dir(dir)
+    if vim.fn.isdirectory(dir) == 0 then
+      return
+    end
+    for _, f in ipairs(vim.fn.globpath(dir, '*.md', false, true)) do
+      local name = stem(f)
+      if not seen[name] then
+        out[#out + 1] = name
+        seen[name] = true
+      end
+    end
+    for _, f in ipairs(vim.fn.globpath(dir, '*/*.md', false, true)) do
+      local rel = f:sub(#dir + 2):gsub('%.md$', '')
+      if not seen[rel] then
+        out[#out + 1] = rel
+        seen[rel] = true
+      end
+    end
+  end
+  add_dir(vim.fn.expand '~/.config/.zk/templates')
+  if root then
+    add_dir(join_paths(root, '.zk', 'templates'))
+  end
+  table.sort(out)
+  return out
+end
+
+local function has_frontmatter(lines)
+  local i = 1
+  while i <= #lines and trim(lines[i]) == '' do
+    i = i + 1
+  end
+  if i <= #lines and trim(lines[i]) == '---' then
+    -- find closing fence
+    for j = i + 1, math.min(#lines, i + 200) do
+      if trim(lines[j]) == '---' then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function yaml_block(meta)
+  local fm = { '---' }
+  if meta.title and meta.title ~= '' then
+    fm[#fm + 1] = ('title: "%s"'):format(meta.title:gsub('"', '\\"'))
+  end
+  fm[#fm + 1] = ('created: %s'):format(os.date '!%Y-%m-%d')
+  if meta.tags and #meta.tags > 0 then
+    fm[#fm + 1] = 'tags:'
+    for _, t in ipairs(meta.tags) do
+      fm[#fm + 1] = ('  - "%s"'):format(t:gsub('"', '\\"'))
+    end
+  end
+  fm[#fm + 1] = '---'
+  fm[#fm + 1] = ''
+  return fm
+end
+
+local function insert_backlink(new_buf, new_dir, src_path)
+  if not M.cfg.backlink.enabled then
+    return
+  end
+  local src_title = get_first_h1_title(src_path) or stem(src_path)
+  local wiki_rel = rel_wiki_path(new_dir, src_path)
+  local line = ('Backlink: [[%s|%s]]'):format(wiki_rel, src_title)
+  if M.cfg.backlink.position == 'top' then
+    vim.api.nvim_buf_set_lines(new_buf, 0, 0, false, { line, '' })
+  else
+    local last = vim.api.nvim_buf_line_count(new_buf)
+    local hdr = ('## %s'):format(M.cfg.backlink.heading)
+    vim.api.nvim_buf_set_lines(new_buf, last, last, false, { '', hdr, '', '- ' .. line })
+  end
+end
+
+local function attach_markdown_tools(bufnr)
+  vim.bo[bufnr].filetype = (vim.bo[bufnr].filetype ~= '' and vim.bo[bufnr].filetype) or 'markdown'
+  pcall(function()
+    local ok, rm = pcall(require, 'render-markdown')
+    if ok and rm and rm.attach then
+      rm.attach { buf = bufnr }
+    end
+  end)
+end
+
+local function _push_history(path)
+  if not path or path == '' then
+    return
+  end
+  table.insert(M._history, 1, { path = path, ts = os.time() })
+  if #M._history > M.cfg.history_limit then
+    table.remove(M._history)
+  end
+end
+
+local function open_file(path, opts)
+  if not path or path == '' then
+    return
+  end
+  vim.cmd.edit(vim.fn.fnameescape(path))
+  _push_history(path)
+  if opts and opts.anchor and opts.anchor ~= '' then
+    local a = opts.anchor:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1')
+    vim.schedule(function()
+      vim.fn.search('\\c^\\s*#\\+\\s*' .. a, 'w')
+    end)
+  end
+end
+
+local function log_created(path, title)
+  if not M.cfg.log_file then
+    return
+  end
+  local line = os.date '!%Y-%m-%dT%H:%M:%SZ' .. '\t' .. (title or '') .. '\t' .. path .. '\n'
+  pcall(vim.fn.writefile, { line }, M.cfg.log_file, 'a')
+end
+
+local function refresh_source_buffer(src_buf)
+  if M.cfg.refresh_source_strategy ~= 'write' then
+    return
+  end
+  if not src_buf or not vim.api.nvim_buf_is_loaded(src_buf) then
+    return
+  end
+  -- Write without autocommands to ping LSP filewatchers but keep UX quiet.
+  vim.api.nvim_buf_call(src_buf, function()
+    pcall(vim.cmd, 'silent keepalt keepjumps noautocmd update')
+  end)
+end
+
+local function write_new_note_at(path, title, template, meta)
+  ensure_dir(dirname(path))
+  vim.cmd.edit(vim.fn.fnameescape(path))
+  local buf = vim.api.nvim_get_current_buf()
+
+  local lines = {}
+  if template and template ~= '' then
+    local roots = { vim.fn.expand '~/.config/.zk/templates', join_paths(find_notebook_root(path) or '', '.zk', 'templates') }
+    for _, root in ipairs(roots) do
+      local full = join_paths(root, template .. '.md')
+      if vim.fn.filereadable(full) == 1 then
+        local content = vim.fn.readfile(full)
+        if content and #content > 0 then
+          lines = render_template(content, meta or { title = title })
+          break
+        end
+      end
+    end
+  end
+
+  if #lines == 0 then
+    lines = { ('# %s'):format(title), '' }
+  end
+  -- Ensure YAML frontmatter exists (and keep template frontmatter if already present)
+  if not has_frontmatter(lines) then
+    local fm = yaml_block(meta or { title = title })
+    for i = #fm, 1, -1 do
+      table.insert(lines, 1, fm[i])
+    end
+  end
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  attach_markdown_tools(buf)
+
+  local old_undofile = vim.bo[buf].undofile
+  vim.bo[buf].undofile = false
+  pcall(vim.cmd, 'silent keepalt keepjumps noautocmd write')
+  vim.bo[buf].undofile = old_undofile
+
+  log_created(path, title)
+  return buf
+end
+
+-- ------------------------ MAIN FLOWS ---------------------------------
+local function should_ignore_target(target)
+  return (not target or target == '' or target:match '^%a+://')
+end
+local function split_anchor(target)
+  local p, a = target:match '^(.-)#(.+)$'
+  return p or target, a
+end
+
+local function create_directory_if_needed(root, here_dir, raw_target)
+  if not raw_target:match '/$' then
+    return false, nil
+  end
+  local dir, base = resolve_dir_and_basename(root, here_dir, raw_target)
+  local final_dir = join_paths(dir, base)
+  ensure_dir(final_dir)
+  vim.notify(('Created directory: %s'):format(final_dir))
+  return true, final_dir
+end
+
+local function create_note_flow(root, here_dir, target_no_anchor, display_title, opts)
+  opts = opts or {}
+  local mode = M.cfg.filename_mode
+  local dir, base = resolve_dir_and_basename(root, here_dir, target_no_anchor)
+  local title = display_title or base
+
+  co_run(function()
+    local chosen_title, tags_line, template = title, '', ''
+    if not opts.instant then
+      local input = await_input('Title: ', chosen_title)
+      if input and input ~= '' then
+        chosen_title = input
+      end
+      tags_line = await_input('Tags (comma separated, optional): ', '')
+      local templates = list_templates(root)
+      if #templates > 0 then
+        local pick = await_select(templates, { prompt = 'Template (Enter to skip):' })
+        template = type(pick) == 'string' and pick or (pick and pick.label) or ''
+      end
+      if not await_confirm(("Create note '%s' in %s?"):format(chosen_title, dir)) then
+        return
+      end
+    end
+
+    local tags = {}
+    for t in (tags_line or ''):gmatch '[^,]+' do
+      t = trim(t)
+      if t ~= '' then
+        tags[#tags + 1] = t
+      end
+    end
+    if #tags == 0 then
+      tags = nil
+    end
+
+    local src_buf = vim.api.nvim_get_current_buf()
+    local src_path = vim.api.nvim_buf_get_name(src_buf)
+
+    if mode == 'typed' or mode == 'slug' then
+      local fname
+      if mode == 'typed' then
+        fname = base .. '.md'
+      else
+        fname = slugify(chosen_title)
+        if M.cfg.id_prefix then
+          fname = random_id(M.cfg.id_length) .. '-' .. fname
+        end
+        fname = fname .. '.md'
+      end
+      local final_path = normalize_path(join_paths(dir, fname))
+      local new_buf = write_new_note_at(final_path, chosen_title, template ~= '' and template or nil, {
+        title = chosen_title,
+        id = M.cfg.id_prefix and random_id(M.cfg.id_length) or '',
+        tags = tags,
+      })
+      insert_backlink(new_buf, dirname(final_path), src_path)
+      if M.cfg.autosave_created then
+        pcall(vim.cmd, 'silent noautocmd write')
+      end
+      _push_history(final_path)
+      vim.notify(('Created: %s  (%s)'):format(chosen_title, final_path))
+      refresh_source_buffer(src_buf)
+
+      if opts.follow == false then
+        -- Jump back to the source window/buffer if requested
+        local wins = vim.api.nvim_list_wins()
+        for _, w in ipairs(wins) do
+          if vim.api.nvim_win_get_buf(w) == src_buf then
+            vim.api.nvim_set_current_win(w)
+            break
+          end
+        end
+      end
+    else
+      -- zk CLI path
+      local before = vim.api.nvim_get_current_buf()
+      require('zk').new { title = chosen_title, dir = dir, tags = tags, template = (template ~= '' and template or nil) }
+      vim.schedule(function()
+        local newbuf = vim.api.nvim_get_current_buf()
+        local newpath = vim.api.nvim_buf_get_name(newbuf)
+        insert_backlink(newbuf, dirname(newpath), src_path)
+        attach_markdown_tools(newbuf)
+        if M.cfg.autosave_created then
+          pcall(vim.cmd, 'silent noautocmd write')
+        end
+        _push_history(newpath)
+        vim.notify(('ZK created: %s  (%s)'):format(chosen_title, newpath))
+        refresh_source_buffer(before)
+        if opts.follow == false then
+          local wins = vim.api.nvim_list_wins()
+          for _, w in ipairs(wins) do
+            if vim.api.nvim_win_get_buf(w) == before then
+              vim.api.nvim_set_current_win(w)
+              break
+            end
+          end
+        end
+      end)
+    end
+  end)
+end
+
+function M.follow_or_create(opts)
+  local here = vim.fn.expand '%:p'
+  local root = find_notebook_root(here)
+  if not root then
+    return vim.notify('ZK: notebook root not found.', vim.log.levels.ERROR)
+  end
+
+  local w = wikilink_at_cursor()
+  if not w then
+    return vim.notify('No [[wikilink]] under cursor', vim.log.levels.INFO)
+  end
+  if should_ignore_target(w.target) then
+    return
+  end
+
+  local path_part, anchor = split_anchor(w.target)
+  local here_dir = dirname(here)
+
+  -- Support pure-directory links like [[foo/bar/]]
+  local made_dir, dir_path = create_directory_if_needed(root, here_dir, path_part)
+  if made_dir then
+    return
+  end
+
+  local target_no_ext = path_part:gsub('%.md$', '')
+  local found = find_existing(root, here_dir, target_no_ext)
+
+  if #found >= 1 then
+    local function open_choice(p)
+      open_file(p, { anchor = anchor })
+    end
+    if #found == 1 then
+      return open_choice(found[1])
+    end
+    local items = {}
+    for _, p in ipairs(found) do
+      items[#items + 1] = relpath(root, p)
+    end
+    return co_run(function()
+      local pick = await_select(items, { prompt = 'Open note:' })
+      if pick then
+        open_choice(join_paths(root, type(pick) == 'string' and pick or pick.label))
+      end
+    end)
+  elseif anchor then
+    return vim.notify("Won't create for anchor link: file not found for [[" .. path_part .. '#' .. anchor .. ']]', vim.log.levels.WARN)
+  else
+    local default_title = w.alias or stem(path_part:match '([^/]+)$' or path_part):gsub('_', ' '):gsub('-', ' ')
+    return create_note_flow(root, here_dir, target_no_ext, default_title, opts or {})
+  end
+end
+
+function M.instant_create()
+  return M.follow_or_create { instant = true }
+end
+
+function M.create_without_follow()
+  return M.follow_or_create { instant = false, follow = false }
+end
+
+function M.follow_only()
+  local here = vim.fn.expand '%:p'
+  local root = find_notebook_root(here)
+  if not root then
+    return vim.notify('ZK: notebook root not found.', vim.log.levels.ERROR)
+  end
+  local w = wikilink_at_cursor()
+  if not w then
+    return vim.notify('No [[wikilink]] under cursor', vim.log.levels.INFO)
+  end
+  local path_part = (w.target:match '^(.-)#') or w.target
+  local target_no_ext = path_part:gsub('%.md$', '')
+  local found = find_existing(root, dirname(here), target_no_ext)
+  if #found == 0 then
+    return vim.notify(("No note found for '%s'"):format(w.target), vim.log.levels.WARN)
+  elseif #found == 1 then
+    return open_file(found[1])
+  else
+    local items = {}
+    for _, p in ipairs(found) do
+      items[#items + 1] = relpath(root, p)
+    end
+    return co_run(function()
+      local pick = await_select(items, { prompt = 'Open note:' })
+      if pick then
+        open_file(join_paths(root, type(pick) == 'string' and pick or pick.label))
+      end
+    end)
+  end
+end
+
+-- ------------------------ HISTORY ----------------------------
+function M.history_picker()
+  if #M._history == 0 then
+    return vim.notify('ZK history is empty', vim.log.levels.INFO)
+  end
+  local items = {}
+  for _, it in ipairs(M._history) do
+    items[#items + 1] = { display = os.date('%Y-%m-%d %H:%M', it.ts) .. '  ' .. it.path, path = it.path }
+  end
+  return co_run(function()
+    local pick = await_select(items, { prompt = 'Recent ZK jumps:' })
+    local path = nil
+    if type(pick) == 'table' then
+      path = pick.path or pick.value or pick[1]
+    elseif type(pick) == 'string' then
+      local s = pick:match '%s%s(.*)$'
+      path = s or pick
+    end
+    if path and path ~= '' then
+      open_file(path)
+    end
+  end)
+end
+
+-- ------------------------ BACKLINK POWER-UPS -----------------
+local function all_wikilinks_in_range(buf, r1, r2)
+  local links = {}
+  for lno = r1, r2 do
+    local line = vim.api.nvim_buf_get_lines(buf, lno - 1, lno, false)[1] or ''
+    for inner in line:gmatch '%[%[([^%]]-)%]%]' do
+      local target = trim((inner:match '^(.-)|') or inner)
+      if target ~= '' and not target:match '^%a+://' then
+        links[#links + 1] = target
+      end
+    end
+  end
+  return links
+end
+
+local function ensure_backlink_in_file(target_path, from_path)
+  local ok, lines = pcall(vim.fn.readfile, target_path)
+  if not ok or not lines then
+    return
+  end
+  local dir = dirname(target_path)
+  local wiki_rel = rel_wiki_path(dir, from_path)
+  local src_title = get_first_h1_title(from_path) or stem(from_path)
+  local backlink_line = ('- Backlink: [[%s|%s]]'):format(wiki_rel, src_title)
+
+  local already = false
+  for _, l in ipairs(lines) do
+    if l:find('%[%[' .. vim.pesc(wiki_rel) .. '%|') then
+      already = true
+      break
+    end
+  end
+  if already then
+    return
+  end
+
+  -- find a Backlinks section, else append one
+  local insert_idx = #lines + 1
+  for i = #lines, 1, -1 do
+    if lines[i]:match '^##%s+Backlinks' then
+      insert_idx = i + 1
+      break
+    end
+  end
+  if insert_idx == #lines + 1 then
+    table.insert(lines, '')
+    table.insert(lines, '## Backlinks')
+    table.insert(lines, '')
+  end
+  table.insert(lines, backlink_line)
+  pcall(vim.fn.writefile, lines, target_path)
+end
+
+function M.add_backlinks_for_selection()
+  local buf = vim.api.nvim_get_current_buf()
+  local here = vim.api.nvim_buf_get_name(buf)
+  local root = find_notebook_root(here)
+  if not root or here == '' then
+    return
+  end
+  local r1 = vim.fn.line 'v'
+  local r2 = vim.fn.line '.'
+  if r1 > r2 then
+    r1, r2 = r2, r1
+  end
+  local links = all_wikilinks_in_range(buf, r1, r2)
+  local here_dir = dirname(here)
+  for _, raw in ipairs(links) do
+    local path_part = raw:gsub('#.*$', ''):gsub('%.md$', '')
+    local found = find_existing(root, here_dir, path_part)
+    if #found >= 1 then
+      ensure_backlink_in_file(found[1], here)
+    end
+  end
+  vim.notify(('Backlinks ensured for %d link(s)'):format(#links))
+end
+
+function M.add_backlinks_for_buffer()
+  local buf = vim.api.nvim_get_current_buf()
+  local here = vim.api.nvim_buf_get_name(buf)
+  local root = find_notebook_root(here)
+  if not root or here == '' then
+    return
+  end
+  local links = all_wikilinks_in_range(buf, 1, vim.api.nvim_buf_line_count(buf))
+  local here_dir = dirname(here)
+  for _, raw in ipairs(links) do
+    local path_part = raw:gsub('#.*$', ''):gsub('%.md$', '')
+    local found = find_existing(root, here_dir, path_part)
+    if #found >= 1 then
+      ensure_backlink_in_file(found[1], here)
+    end
+  end
+  vim.notify(('Backlinks ensured for %d link(s)'):format(#links))
+end
+
+-- ------------------------ PREVIEW (peek) ---------------------
+local function open_floating(lines, opts)
+  opts = opts or {}
+  local width = opts.width or M.cfg.preview.width
+  local height = math.min(#lines, M.cfg.preview.max_lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local ui = vim.api.nvim_list_uis()[1]
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = math.floor((ui.height - height) / 2),
+    col = math.floor((ui.width - width) / 2),
+    style = 'minimal',
+    border = M.cfg.preview.border,
+  })
+  vim.keymap.set('n', 'q', function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, nowait = true })
+end
+
+function M.peek_wikilink()
+  if not M.cfg.preview.enabled then
+    return
+  end
+  local here = vim.fn.expand '%:p'
+  local root = find_notebook_root(here)
+  if not root then
+    return
+  end
+  local w = wikilink_at_cursor()
+  if not w then
+    return
+  end
+  local path_part = (w.target:match '^(.-)#') or w.target
+  local here_dir = dirname(here)
+  local found = find_existing(root, here_dir, path_part:gsub('%.md$', ''))
+  if #found == 0 then
+    return
+  end
+  local ok, lines = pcall(vim.fn.readfile, found[1])
+  if not ok or not lines then
+    return
+  end
+  for i = #lines, M.cfg.preview.max_lines + 1, -1 do
+    lines[i] = nil
+  end
+  open_floating(lines, {})
+end
+
+-- ------------------------ MAPPINGS / SETUP -------------------
+local function on_enter_expr()
+  local w = wikilink_at_cursor()
+  if w then
+    vim.schedule(function()
+      M.follow_or_create()
+    end)
+    return ''
+  else
+    return '\r'
+  end
+end
+
+local function map_jumplist(buf)
+  local opts = { buffer = buf }
+  vim.keymap.set('n', '<leader><leader><leader>zb', function()
+    feedkeys '<C-o>'
+  end, vim.tbl_extend('force', opts, { desc = 'ZK: back (jumplist)' }))
+  vim.keymap.set('n', '<leader><leader><leader>zf', function()
+    feedkeys '<C-i>'
+  end, vim.tbl_extend('force', opts, { desc = 'ZK: forward (jumplist)' }))
+  -- Uppercase aliases (requested)
+  vim.keymap.set('n', '<leader><leader><leader>ZB', function()
+    feedkeys '<C-o>'
+  end, vim.tbl_extend('force', opts, { desc = 'ZK: Back (jumplist)' }))
+  vim.keymap.set('n', '<leader><leader><leader>ZF', function()
+    feedkeys '<C-i>'
+  end, vim.tbl_extend('force', opts, { desc = 'ZK: Forward (jumplist)' }))
+end
+
+-- Soften ZK "dead-link" diagnostics to HINT
+local function soften_zk_deadlink_diagnostics()
+  local grp = vim.api.nvim_create_augroup('zk-deadlink-soften', { clear = true })
+  vim.api.nvim_create_autocmd('LspAttach', {
+    group = grp,
+    callback = function(args)
+      local client = vim.lsp.get_client_by_id(args.data.client_id)
+      if not client or (client.name ~= 'zk' and client.name ~= 'zk_lsp') then
+        return
+      end
+      local orig = client.handlers['textDocument/publishDiagnostics'] or vim.lsp.handlers['textDocument/publishDiagnostics']
+      client.handlers['textDocument/publishDiagnostics'] = function(err, result, ctx, cfg)
+        if result and result.diagnostics then
+          for _, d in ipairs(result.diagnostics) do
+            if (d.code == 'dead-link') or (d.source and d.source:match 'zk' and (d.message or ''):lower():match 'dead') then
+              d.severity = vim.diagnostic.severity.HINT
+            end
+          end
+        end
+        return orig(err, result, ctx, cfg)
+      end
+    end,
+  })
+end
+
+-- which-key group
+local function register_which_key()
+  local ok, wk = pcall(require, 'which-key')
+  if not ok then
+    return
+  end
+  wk.add { { '<leader><leader><leader>z', group = 'ZK (wikilinks)' } }
+end
+
+-- ===================== blink.cmp provider (class-style) =====================
+local function inside_wikilink_ctx(line, col)
+  local left = line:sub(1, col)
+  local open_pos = left:match '()%[%[[^%]]*$'
+  if not open_pos then
+    return nil
+  end
+  local prefix = left:sub(open_pos + 1):gsub('^%s+', ''):gsub('|.*$', '')
+  return prefix
+end
+
+local function list_rel_candidates(root, here_dir, prefix)
+  local dir = select(1, resolve_dir_and_basename(root, here_dir, prefix))
+  local base_dir = normalize_path(dir)
+  local results = {}
+  local function emit(p, is_dir)
+    local rel = rel_wiki_path(here_dir, p)
+    if is_dir then
+      rel = rel .. '/'
+    end
+    results[#results + 1] = {
+      label = rel,
+      insert_text = rel,
+      kind = is_dir and 19 or 17,
+      detail = is_dir and 'Folder' or 'Note',
+      score_offset = is_dir and 5 or 0,
+    }
+  end
+  if vim.fn.isdirectory(base_dir) == 1 then
+    for _, d in ipairs(vim.fn.globpath(base_dir, '*/', false, true)) do
+      emit(d, true)
+    end
+    for _, f in ipairs(vim.fn.globpath(base_dir, '*.md', false, true)) do
+      emit(f, false)
+    end
+  end
+  return results
+end
+
+-- Provider class API for blink: module must export .new()
+local ProviderClass = {}
+ProviderClass.__index = ProviderClass
+function ProviderClass.new()
+  local self = setmetatable({}, ProviderClass)
+  return self
+end
+function ProviderClass:is_available(ctx)
+  local buf = ctx and ctx.buf or vim.api.nvim_get_current_buf()
+  return vim.bo[buf].filetype == 'markdown'
+end
+function ProviderClass:get_trigger_characters()
+  return { '[', '/', '.', '-' }
+end
+function ProviderClass:get_completions(ctx, callback)
+  local buf = (ctx and ctx.buf) or vim.api.nvim_get_current_buf()
+  local row, col
+  if ctx and ctx.row and ctx.col then
+    row, col = ctx.row, ctx.col
+  else
+    local pos = vim.api.nvim_win_get_cursor(0)
+    row = pos[1] - 1
+    col = pos[2]
+  end
+  local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ''
+  local prefix = inside_wikilink_ctx(line, col)
+  if not prefix then
+    return callback { is_incomplete = false, items = {} }
+  end
+
+  local here = vim.api.nvim_buf_get_name(buf)
+  local root = find_notebook_root(here)
+  if not root then
+    return callback { is_incomplete = false, items = {} }
+  end
+  local here_dir = dirname(here)
+  local items = list_rel_candidates(root, here_dir, prefix)
+  callback { is_incomplete = false, items = items }
+end
+
+-- Expose as separate module for blink
+package.loaded['zk_follow_create.completion'] = {
+  new = function()
+    return ProviderClass.new()
+  end,
+}
+
+function M.setup(user_cfg)
+  if type(user_cfg) == 'table' then
+    M.cfg = vim.tbl_deep_extend('force', M.cfg, user_cfg)
+  end
+  soften_zk_deadlink_diagnostics()
+  register_which_key()
+  vim.api.nvim_create_autocmd('FileType', {
+    pattern = 'markdown',
+    callback = function(args)
+      local buf = args.buf
+      vim.keymap.set('n', '<leader><leader><leader>z', function()
+        require('zk_follow_create').follow_or_create()
+      end, { buffer = buf, desc = 'ZK: follow [[link]] or create' })
+      vim.keymap.set('n', '<leader><leader><leader>Z', function()
+        require('zk_follow_create').instant_create()
+      end, { buffer = buf, desc = 'ZK: instant create [[link]]' })
+      vim.keymap.set('n', '<leader><leader><leader>zo', function()
+        require('zk_follow_create').follow_only()
+      end, { buffer = buf, desc = 'ZK: open [[link]] only' })
+      vim.keymap.set('n', '<leader><leader><leader>zc', function()
+        require('zk_follow_create').create_without_follow()
+      end, { buffer = buf, desc = 'ZK: create note here (no follow)' })
+      vim.keymap.set('n', '<leader><leader><leader>zbk', function()
+        require('zk_follow_create').add_backlinks_for_buffer()
+      end, { buffer = buf, desc = 'ZK: ensure backlinks for all links in buffer' })
+      vim.keymap.set('v', '<leader><leader><leader>zbk', function()
+        require('zk_follow_create').add_backlinks_for_selection()
+      end, { buffer = buf, desc = 'ZK: ensure backlinks for selected links' })
+      vim.keymap.set('n', '<leader><leader><leader>zp', function()
+        require('zk_follow_create').peek_wikilink()
+      end, { buffer = buf, desc = 'ZK: peek note in float' })
+
+      if M.cfg.map_enter then
+        vim.keymap.set(
+          'n',
+          '<CR>',
+          (function()
+            return on_enter_expr
+          end)(),
+          { buffer = buf, expr = true, desc = 'ZK: <CR> follow/create [[link]]' }
+        )
+      end
+      if M.cfg.map_jumplist then
+        map_jumplist(buf)
+      end
+    end,
+  })
+end
+
+return M

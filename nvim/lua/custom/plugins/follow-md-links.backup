@@ -1,0 +1,4 @@
+return {
+  'jghauser/follow-md-links.nvim',
+  vim.keymap.set('n', '<BS>', ':edit #<CR>', { desc = 'Return to previous file', silent = true }),
+}
