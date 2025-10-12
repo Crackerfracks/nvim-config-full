@@ -1,3 +1,0 @@
-return {
-  'monaqa/dial.nvim',
-}
