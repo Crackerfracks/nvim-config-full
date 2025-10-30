@@ -16,14 +16,14 @@ return {
       lua = { 'stylua' },
       python = { 'ruff' }, -- uses the Ruff formatter  :contentReference[oaicite:0]{index=0}
       sh = { 'shfmt' },
-      json = { 'fixjson', 'prettierd' },
+      json = { 'fixjson' },
       jsonc = { 'fixjson' },
-      markdown = { 'prettierd' },
-      javascript = { 'prettierd', 'standardjs' }, -- standardjs is built-in  :contentReference[oaicite:1]{index=1}
-      typescript = { 'prettierd', 'standardjs' },
-      yaml = { 'prettierd' },
-      html = { 'prettierd' },
-      css = { 'prettierd' },
+      markdown = { 'rumdl', 'mdsf' },
+      javascript = { 'standardjs' }, -- standardjs is built-in  :contentReference[oaicite:1]{index=1}
+      typescript = { 'standardjs' },
+      -- yaml = { 'prettierd' },
+      -- html = { 'prettierd' },
+      -- css = { 'prettierd' },
       c = { 'clang_format' },
       cpp = { 'clang_format' },
     },

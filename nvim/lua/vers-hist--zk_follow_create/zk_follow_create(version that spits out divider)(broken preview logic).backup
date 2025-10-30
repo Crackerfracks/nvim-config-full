@@ -1,0 +1,1439 @@
+-- ~/.config/nvim/lua/zk_follow_create.lua
+-- ZK follow/create + navigation links + backlinks + related + previews (with persistence)
+-- + blink.cmp provider for relative [[./]] completion
+-- Implements: robust frontmatter/links folding, directory-link following via oil.nvim,
+--             relative-wikilink insert mapping, preview pin/move/resize, persisted layout,
+--             tag/alias parsing resilient to newlines, and long-path undo mitigation.
+
+local M = {}
+
+-- =========================== CONFIG ===========================
+M.cfg = {
+  filename_mode = 'typed', -- 'typed' | 'slug' | 'zk'
+  id_prefix = false,
+  id_length = 4,
+
+  backlinks = {
+    enabled = true,
+    section_header = 'Navigation Links', -- renamed from "Links"
+    subsection_backlinks = 'Backlinks',
+    subsection_related = 'Related (shares tags)',
+    fold_by_default = true,
+    fold_delimiter = '---', -- used to delimit the fold body after the header
+  },
+
+  telescope_ui = true,
+
+  -- Keymaps
+  map_enter = true, -- <CR> on a wikilink follows/creates
+  map_namespace = true, -- <leader>z? namespace
+  map_insert_relative = '<leader>z.', -- inserts [[./]] and places cursor after '/'
+
+  -- Preview UI
+  preview = {
+    auto = false,
+    layout = 'topleft', -- 'topleft' | 'bottomright'
+    width = 0.45,
+    height = 14,
+    stack_gap = 1,
+    border = 'rounded',
+
+    persist = true, -- save/restore pinned previews per-note
+    controls_toggle = '<leader>zm', -- toggle move/resize keymaps in preview windows
+    move_step = 2,
+    resize_step = 2,
+  },
+
+  folds = { frontmatter = true, links = true },
+  virt_tags = { enabled = true, hl = 'Comment' },
+
+  autosave_created = true,
+  log_file = nil,
+
+  -- Undo/Swap long-path mitigation
+  use_hashed_undodir = true,
+  undodir = (vim.fn.stdpath 'state' .. '/undo//'), -- trailing // creates subdirs; avoids 255 filename limit
+}
+
+-- =========================== STATE ============================
+M._history = {}
+M._previews = { hidden = false, items = {}, order = {}, controls_enabled = false }
+M._ns_tags = vim.api.nvim_create_namespace 'zkfc_tags'
+
+-- =========================== UTILS ============================
+local function trim(s)
+  return (s or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+local function slugify(s)
+  s = (s or ''):lower():gsub('%s+', '-'):gsub('[^%w_%-%.]', '-'):gsub('%-+', '-')
+  return s:gsub('^%-', ''):gsub('%-$', '')
+end
+local function random_id(n)
+  local a = '0123456789abcdefghjkmnpqrstvwxyz'
+  local t = {}
+  for i = 1, n do
+    local k = math.random(#a)
+    t[i] = a:sub(k, k)
+  end
+  return table.concat(t)
+end
+local function path_sep()
+  return package.config:sub(1, 1)
+end
+local function normalize_path(p)
+  local abs = vim.fn.fnamemodify(p, ':p')
+  if path_sep() == '\\' then
+    abs = abs:gsub('\\', '/')
+  end
+  return abs:gsub('/+$', '')
+end
+local function join(...)
+  return normalize_path(table.concat({ ... }, path_sep()))
+end
+local function dirname(p)
+  return vim.fn.fnamemodify(p, ':h')
+end
+local function basename(p)
+  return vim.fn.fnamemodify(p, ':t')
+end
+local function stem(p)
+  return vim.fn.fnamemodify(p, ':t:r')
+end
+local function without_ext(p)
+  return vim.fn.fnamemodify(p, ':r')
+end
+local function ensure_dir(p)
+  if p and vim.fn.isdirectory(p) == 0 then
+    vim.fn.mkdir(p, 'p')
+  end
+end
+local function feedkeys(keys)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', true)
+end
+
+local function _split_slash(p)
+  p = (p or ''):gsub('\\', '/'):gsub('/+', '/')
+  local t = {}
+  for part in p:gmatch '[^/]+' do
+    t[#t + 1] = part
+  end
+  return t
+end
+local function relpath(base_dir, target_path)
+  local b = _split_slash(normalize_path(base_dir))
+  local t = _split_slash(normalize_path(target_path))
+  local i = 1
+  while i <= #b and i <= #t and b[i] == t[i] do
+    i = i + 1
+  end
+  local parts = {}
+  for _ = i, #b do
+    parts[#parts + 1] = '..'
+  end
+  for j = i, #t do
+    parts[#parts + 1] = t[j]
+  end
+  local rp = table.concat(parts, '/')
+  return rp == '' and '.' or rp
+end
+local function rel_wiki_path(from_dir, target_path)
+  return without_ext(relpath(from_dir, target_path))
+end
+
+local function find_notebook_root(abs_path)
+  local ok, util = pcall(require, 'zk.util')
+  if ok and util and util.notebook_root then
+    local root = util.notebook_root(abs_path)
+    if root and root ~= '' then
+      return normalize_path(root)
+    end
+  end
+  if vim.env.ZK_NOTEBOOK_DIR and vim.fn.isdirectory(vim.env.ZK_NOTEBOOK_DIR) == 1 then
+    return normalize_path(vim.env.ZK_NOTEBOOK_DIR)
+  end
+  local dir = vim.fn.fnamemodify(abs_path, ':p:h')
+  while dir and dir ~= path_sep() do
+    if vim.fn.isdirectory(join(dir, '.zk')) == 1 then
+      return normalize_path(dir)
+    end
+    dir = dirname(dir)
+  end
+  return nil
+end
+
+-- ================== FRONTMATTER / TAGS ========================
+local function read_frontmatter_block(lines)
+  if not (lines[1] and lines[1]:match '^%-%-%-$') then
+    return nil, nil
+  end
+  for i = 2, #lines do
+    if lines[i]:match '^%-%-%-$' then
+      local fm_lines = { unpack(lines, 1, i) }
+      return table.concat(fm_lines, '\n'), i
+    end
+  end
+  return nil, nil
+end
+
+local function parse_frontmatter(lines)
+  local fm_text, close_i = read_frontmatter_block(lines)
+  local tags, aliases = {}, {}
+
+  if not fm_text then
+    return { yaml = nil, tags = tags, aliases = aliases, close_i = nil }
+  end
+
+  -- Handle flow-style arrays possibly spanning multiple lines: tags: [a,
+  -- b, c]
+  local function parse_flow_array(key)
+    local pattern = key .. '%s*:%s*%[(.-)%]'
+    local m = fm_text:match(pattern)
+    if m then
+      -- collapse newlines/spaces, then split by commas
+      m = m:gsub('\n', ' ')
+      for item in m:gmatch '[^,%]]+' do
+        local v = trim(item):gsub('^[\'"]', ''):gsub('[\'"]$', '')
+        if v ~= '' then
+          if key == 'tags' then
+            tags[#tags + 1] = v
+          else
+            aliases[#aliases + 1] = v
+          end
+        end
+      end
+    end
+  end
+
+  -- Also support simple block-style:
+  local function parse_block_array(key)
+    -- e.g. tags:\n - a\n - b
+    local block = fm_text:match(key .. '%s*:%s*\n([^\n]-)\n[%w_%-]+%s*:') -- until next key
+    block = block or fm_text:match(key .. '%s*:%s*\n([^\n]-)\n%-%-%-') -- until fm end
+    if block then
+      for item in block:gmatch '%-([^%\n]+)' do
+        local v = trim(item):gsub('^[\'"]', ''):gsub('[\'"]$', '')
+        if v ~= '' then
+          if key == 'tags' then
+            tags[#tags + 1] = v
+          else
+            aliases[#aliases + 1] = v
+          end
+        end
+      end
+    end
+  end
+
+  parse_flow_array 'tags'
+  parse_block_array 'tags'
+  parse_flow_array 'aliases'
+  parse_block_array 'aliases'
+
+  return { yaml = fm_text, tags = tags, aliases = aliases, close_i = close_i }
+end
+
+local function get_first_h1_title(path)
+  local ok, lines = pcall(vim.fn.readfile, path, '', 80)
+  if not ok or not lines then
+    return nil
+  end
+  for _, l in ipairs(lines) do
+    local t = l:match '^#%s+(.+)$'
+    if t then
+      -- If H1 is a wikilink with alias, return the alias only
+      local alias = t:match '^%[%[[^%]|]-|([^%]]+)%]%]$'
+      if alias then
+        return trim(alias)
+      end
+      -- If H1 is a plain wikilink without alias, return the target stem
+      local tgt = t:match '^%[%[([^%]|]+)%]%]$'
+      if tgt then
+        return stem(tgt)
+      end
+      return trim(t)
+    end
+  end
+  return nil
+end
+
+-- ===================== FOLDS =============================
+local function fold_frontmatter(buf)
+  if not M.cfg.folds.frontmatter then
+    return
+  end
+  local n = vim.api.nvim_buf_line_count(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, math.min(300, n), false)
+  local fm = parse_frontmatter(lines)
+  if not fm or not fm.close_i then
+    return
+  end
+
+  -- Fold *exactly* the YAML lines (1..close_i). Do not swallow the blank line or H1.
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_loaded(buf) then
+      return
+    end
+    pcall(vim.api.nvim_buf_call, buf, function()
+      vim.opt_local.foldmethod = 'manual'
+      vim.cmd(string.format('silent! %d,%dfold', 1, fm.close_i))
+      if M.cfg.backlinks.fold_by_default then
+        vim.cmd 'silent! normal! zM'
+      end
+    end)
+  end)
+end
+
+-- Navigation Links fold is delimited like:
+--   ## Navigation Links
+--   ---
+--   ### Backlinks
+--   ...
+--   ### Related (shares tags)
+--   ...
+--   ---
+local function find_nav_links_region(lines, header_text, start_from)
+  local n = #lines
+  local s = nil
+  for i = (start_from or 1), n do
+    if lines[i]:match('^##%s+' .. vim.pesc(header_text) .. '%s*$') then
+      s = i
+      break
+    end
+  end
+  if not s then
+    return nil
+  end
+  local open_delim = nil
+  for i = s + 1, n do
+    if trim(lines[i]) == M.cfg.backlinks.fold_delimiter then
+      open_delim = i
+      break
+    end
+  end
+  if not open_delim then
+    return { header = s }
+  end
+  local close_delim = nil
+  for i = open_delim + 1, n do
+    if trim(lines[i]) == M.cfg.backlinks.fold_delimiter then
+      close_delim = i
+      break
+    end
+  end
+  return { header = s, open_delim = open_delim, close_delim = close_delim }
+end
+
+local function fold_links_section(buf)
+  if not M.cfg.folds.links then
+    return
+  end
+  local n = vim.api.nvim_buf_line_count(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, n, false)
+  local region = find_nav_links_region(lines, M.cfg.backlinks.section_header, 1)
+  if not region or not region.open_delim or not region.close_delim then
+    return
+  end
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_loaded(buf) then
+      return
+    end
+    pcall(vim.api.nvim_buf_call, buf, function()
+      vim.opt_local.foldmethod = 'manual'
+      vim.cmd(string.format('silent! %d,%dfold', region.open_delim, region.close_delim))
+      if M.cfg.backlinks.fold_by_default then
+        vim.cmd 'silent! normal! zM'
+      end
+    end)
+  end)
+end
+
+-- ===================== VIRTUAL TAGS =========================
+local function show_tags_virttext(buf)
+  if not M.cfg.virt_tags.enabled then
+    return
+  end
+  vim.api.nvim_buf_clear_namespace(buf, M._ns_tags, 0, -1)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, math.min(200, vim.api.nvim_buf_line_count(buf)), false)
+  local fm = parse_frontmatter(lines)
+  if not (fm and fm.close_i) then
+    return
+  end
+  if #fm.tags == 0 and #fm.aliases == 0 then
+    return
+  end
+  local text = {}
+  for _, t in ipairs(fm.tags) do
+    table.insert(text, '# ' .. t)
+  end
+  for _, a in ipairs(fm.aliases) do
+    table.insert(text, '@' .. a)
+  end
+  local virt_text = table.concat(text, '  ')
+  vim.api.nvim_buf_set_extmark(buf, M._ns_tags, fm.close_i, 0, { virt_text = { { virt_text, M.cfg.virt_tags.hl } } })
+end
+
+-- ===================== BACKLINKS / RELATED =======================
+local function insert_navigation_links_block(buf, new_dir, parent_src_path, related)
+  if not M.cfg.backlinks.enabled then
+    return
+  end
+
+  local src_title = parent_src_path and (get_first_h1_title(parent_src_path) or stem(parent_src_path)) or nil
+  local wiki_rel = parent_src_path and rel_wiki_path(new_dir, parent_src_path) or nil
+
+  -- Ensure blank line before we start
+  local tail = vim.api.nvim_buf_line_count(buf)
+  local last = vim.api.nvim_buf_get_lines(buf, tail - 1, tail, false)[1] or ''
+  if last:match '%S' then
+    vim.api.nvim_buf_set_lines(buf, tail, tail, false, { '' })
+  end
+
+  local lines = {}
+  lines[#lines + 1] = '## ' .. M.cfg.backlinks.section_header
+  lines[#lines + 1] = M.cfg.backlinks.fold_delimiter
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = '### ' .. M.cfg.backlinks.subsection_backlinks
+  if wiki_rel and src_title then
+    lines[#lines + 1] = ('[[%s|%s]]'):format(wiki_rel, src_title)
+  end
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = '### ' .. M.cfg.backlinks.subsection_related
+  if related and related.list then
+    for _, rel in ipairs(related.list) do
+      lines[#lines + 1] = ('[[%s|%s]]'):format(rel.wiki, rel.title)
+    end
+  end
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = M.cfg.backlinks.fold_delimiter
+
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, { '' })
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, lines)
+end
+
+local function scan_related_by_tags(root, here_path, tags)
+  if not tags or #tags == 0 then
+    return { list = {} }
+  end
+  local out, glob = {}, vim.fn.globpath(root, '**/*.md', false, true)
+  local here = normalize_path(here_path)
+  for _, f in ipairs(glob) do
+    local abs = normalize_path(f)
+    if abs ~= here then
+      local lines = vim.fn.readfile(abs, '', 120)
+      if lines and lines[1] == '---' then
+        local fm = parse_frontmatter(lines)
+        if fm.tags and #fm.tags > 0 then
+          local shared = 0
+          for _, t in ipairs(fm.tags) do
+            for _, mine in ipairs(tags) do
+              if t == mine then
+                shared = shared + 1
+                break
+              end
+            end
+          end
+          if shared > 0 then
+            out[#out + 1] = {
+              path = abs,
+              wiki = rel_wiki_path(dirname(here), abs),
+              title = get_first_h1_title(abs) or stem(abs),
+              shared = shared,
+            }
+          end
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.shared == b.shared then
+      return a.title < b.title
+    else
+      return a.shared > b.shared
+    end
+  end)
+  return { list = out }
+end
+
+-- ============== TEMPLATES / NEW NOTE CONTENT ==================
+local function render_template(lines, meta)
+  local s = table.concat(lines, '\n')
+  local rep = {
+    ['{{title}}'] = meta.title or '',
+    ['{{date}}'] = os.date(meta.date_fmt or '!%Y-%m-%d'),
+    ['{{id}}'] = meta.id or '',
+    ['{{content}}'] = meta.content or '',
+    ['{{tags}}'] = (meta.tags and #meta.tags > 0) and table.concat(meta.tags, ', ') or '',
+  }
+  for k, v in pairs(rep) do
+    s = s:gsub(k, v)
+  end
+  s = s:gsub('%s*$', '')
+  return vim.split(s, '\n', { plain = true })
+end
+
+-- ---------- Writer: strict YAML close, blank line before H1, dedupe H1 ----------
+local function write_new_note_at(path, title, parent_src_path, tags, template)
+  ensure_dir(dirname(path))
+  vim.cmd.edit(vim.fn.fnameescape(path))
+  local buf = vim.api.nvim_get_current_buf()
+
+  local id = M.cfg.id_prefix and random_id(M.cfg.id_length) or ''
+  local lines = {}
+
+  -- YAML frontmatter (open -> close) + blank line
+  lines[#lines + 1] = '---'
+  lines[#lines + 1] = ('title: %s'):format(title)
+  lines[#lines + 1] = ('date: %s'):format(os.date '!%Y-%m-%d')
+  lines[#lines + 1] = ('tags: [%s]'):format(tags and table.concat(tags, ', ') or '')
+  lines[#lines + 1] = 'aliases: []'
+  if id ~= '' then
+    lines[#lines + 1] = ('id: %s'):format(id)
+  end
+  lines[#lines + 1] = '---'
+  lines[#lines + 1] = '' -- critical: blank line so H1 is *not* in frontmatter fold
+
+  -- Canonical H1
+  if parent_src_path and parent_src_path ~= '' then
+    local wiki_rel = rel_wiki_path(dirname(path), parent_src_path)
+    lines[#lines + 1] = ('# [[%s|%s]]'):format(wiki_rel, title)
+  else
+    lines[#lines + 1] = ('# %s'):format(title)
+  end
+  lines[#lines + 1] = '' -- blank after H1
+
+  -- Optional template, dropping duplicate first H1 if present
+  if template and template ~= '' then
+    local roots = { vim.fn.expand '~/.config/.zk/templates', join(find_notebook_root(path) or '', '.zk', 'templates') }
+    for _, root in ipairs(roots) do
+      local full = join(root, template .. '.md')
+      if vim.fn.filereadable(full) == 1 then
+        local tlines = render_template(vim.fn.readfile(full), { title = title, id = id, tags = tags })
+        -- Remove first non-empty H1 if it reproduces the title
+        local first_idx
+        for i, l in ipairs(tlines) do
+          if trim(l) ~= '' then
+            first_idx = i
+            break
+          end
+        end
+        if first_idx then
+          local first = tlines[first_idx]
+          local dup_plain = first:match('^#%s+' .. vim.pesc(title) .. '%s*$')
+          local dup_link = first:match('^#%s+%[%[[^%]]-%|' .. vim.pesc(title) .. '%]%]%s*$')
+          if dup_plain or dup_link then
+            table.remove(tlines, first_idx)
+          end
+        end
+        vim.list_extend(lines, tlines)
+        break
+      end
+    end
+  end
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    if M.cfg.folds.frontmatter then
+      fold_frontmatter(buf)
+    end
+    if M.cfg.virt_tags.enabled then
+      show_tags_virttext(buf)
+    end
+  end)
+
+  return buf
+end
+
+local function log_created(path, title)
+  if not M.cfg.log_file then
+    return
+  end
+  local line = os.date '!%Y-%m-%dT%H:%M:%SZ' .. '\t' .. (title or '') .. '\t' .. path .. '\n'
+  pcall(vim.fn.writefile, { line }, M.cfg.log_file, 'a')
+end
+
+-- ===================== HISTORY ================================
+local function _push_history(path)
+  if not path or path == '' then
+    return
+  end
+  table.insert(M._history, 1, { path = path, ts = os.time() })
+  if #M._history > 200 then
+    table.remove(M._history)
+  end
+end
+
+-- ===================== OPEN / FOLLOW ==========================
+local function open_file(path, opts)
+  if not path or path == '' then
+    return
+  end
+  vim.cmd.edit(vim.fn.fnameescape(path))
+  _push_history(path)
+
+  local target_header = true
+  if opts and opts.anchor then
+    vim.schedule(function()
+      vim.fn.search('\\c^\\s*#\\+\\s*' .. vim.pesc(opts.anchor), 'w')
+    end)
+    target_header = false
+  end
+
+  if target_header then
+    vim.schedule(function()
+      local line = vim.fn.search('^#\\s\\+', 'w')
+      if line > 0 then
+        vim.api.nvim_win_set_cursor(0, { line, 2 })
+      end
+      if opts and opts.follow_mode == 'jump_to_last_search' then
+        local last = vim.fn.getreg '/'
+        if last and last ~= '' then
+          vim.cmd 'normal! n'
+        end
+      end
+    end)
+  end
+end
+
+local function open_directory(dir)
+  -- split orientation: choose based on editor dimensions
+  local width = vim.o.columns
+  local height = vim.o.lines - (vim.o.cmdheight or 1)
+  local cmd = (width > height * 1.2) and 'vsplit' or 'split'
+  vim.cmd(string.format('%s %s', cmd, vim.fn.fnameescape(dir)))
+end
+
+-- ===================== CREATE / RESOLVE ============================
+local function resolve_dir_and_basename(root, here_dir, target)
+  local composed = normalize_path(join(here_dir, target))
+  local has_ext = composed:lower():sub(-3) == '.md'
+  local base = has_ext and stem(basename(composed)) or basename(composed)
+  local dir = dirname(composed)
+  local root_abs = normalize_path(root)
+  if dir:sub(1, #root_abs) ~= root_abs then
+    dir = root_abs
+  end
+  return dir, base, has_ext
+end
+
+local function find_existing(root, here_dir, target_no_anchor)
+  local dir, base = resolve_dir_and_basename(root, here_dir, target_no_anchor)
+  local matches = {}
+  local exact = normalize_path(join(dir, base .. '.md'))
+  if vim.fn.filereadable(exact) == 1 then
+    matches[#matches + 1] = exact
+  end
+  if #matches == 0 then
+    local slug = slugify(base)
+    local function add(d)
+      if vim.fn.isdirectory(d) == 0 then
+        return
+      end
+      for _, p in ipairs(vim.fn.globpath(d, '**/*-' .. slug .. '.md', false, true)) do
+        matches[#matches + 1] = p
+      end
+      for _, p in ipairs(vim.fn.globpath(d, '**/' .. slug .. '.md', false, true)) do
+        matches[#matches + 1] = p
+      end
+    end
+    add(dir)
+    if #matches == 0 then
+      add(root)
+    end
+  end
+  local seen, uniq = {}, {}
+  for _, p in ipairs(matches) do
+    if not seen[p] then
+      uniq[#uniq + 1] = p
+      seen[p] = true
+    end
+  end
+  return uniq
+end
+
+local function list_note_tags(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, math.min(200, vim.api.nvim_buf_line_count(buf)), false)
+  local fm = parse_frontmatter(lines)
+  return (fm and fm.tags) or {}
+end
+
+local function create_note_flow(root, here_dir, target_no_anchor, display_title, opts)
+  opts = opts or {}
+  local mode = M.cfg.filename_mode
+  local dir, base = resolve_dir_and_basename(root, here_dir, target_no_anchor)
+  local title = display_title or base
+
+  -- coroutine with scheduled UI to avoid yield across C-call boundary
+  local function flow()
+    local chosen_title, tags_line, template = title, '', ''
+    if not opts.instant then
+      local ch = vim.fn.input('Title: ', chosen_title)
+      if ch ~= '' then
+        chosen_title = ch
+      end
+      tags_line = vim.fn.input('Tags (comma separated): ', '')
+      local templates = {}
+      do
+        local seen = {}
+        local function list_dir(d)
+          if vim.fn.isdirectory(d) == 0 then
+            return
+          end
+          for _, f in ipairs(vim.fn.globpath(d, '*.md', false, true)) do
+            local nm = stem(f)
+            if not seen[nm] then
+              templates[#templates + 1] = nm
+              seen[nm] = true
+            end
+          end
+        end
+        list_dir(vim.fn.expand '~/.config/.zk/templates')
+        local root_tpl = join(root, '.zk', 'templates')
+        list_dir(root_tpl)
+      end
+      if #templates > 0 then
+        local pick = vim.fn.input('Template (leave blank to skip): ', '')
+        if pick ~= '' then
+          template = pick
+        end
+      end
+      if vim.fn.confirm(("Create note '%s' in %s?"):format(chosen_title, dir), '&Yes\n&No', 1) ~= 1 then
+        return
+      end
+    end
+
+    local tags = {}
+    for t in (tags_line or ''):gmatch '[^,]+' do
+      t = trim(t)
+      if t ~= '' then
+        tags[#tags + 1] = t
+      end
+    end
+    if #tags == 0 then
+      tags = nil
+    end
+
+    local fname
+    if mode == 'typed' then
+      fname = base .. '.md'
+    elseif mode == 'slug' then
+      fname = slugify(chosen_title)
+      if M.cfg.id_prefix then
+        fname = random_id(M.cfg.id_length) .. '-' .. fname
+      end
+      fname = fname .. '.md'
+    else
+      fname = base .. '.md'
+    end
+
+    local final_path = normalize_path(join(dir, fname))
+    local src_path = vim.api.nvim_buf_get_name(0)
+
+    local buf = write_new_note_at(final_path, chosen_title, src_path, tags, (template ~= '' and template or nil))
+
+    -- Compute related + insert full Navigation Links block, then fold
+    local related = scan_related_by_tags(root, final_path, tags or {})
+    insert_navigation_links_block(buf, dirname(final_path), src_path, related)
+    if M.cfg.autosave_created then
+      pcall(vim.cmd, 'silent noautocmd write')
+    end
+    fold_links_section(buf)
+
+    _push_history(final_path)
+    log_created(final_path, chosen_title)
+    vim.notify(('Created: %s  (%s)'):format(chosen_title, final_path))
+  end
+
+  vim.schedule(flow)
+end
+
+-- ===================== PUBLIC FLOWS ===========================
+local function wikilink_at_cursor(buf)
+  buf = buf or 0
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ''
+  for s, inner, e in line:gmatch '()%[%[([^%]]-)%]%]()' do
+    if col + 1 >= s and col + 1 <= e then
+      local tgt, alias = inner:match '^(.-)|(.+)$'
+      return { target = trim(tgt or inner), alias = alias and trim(alias) or nil }
+    end
+  end
+  return nil
+end
+
+local function split_anchor(t)
+  local p, a = t:match '^(.-)#(.+)$'
+  return p or t, a
+end
+local function should_ignore_target(t)
+  return (not t or t == '' or t:match '^%a+://')
+end
+
+function M.follow_or_create(opts)
+  local here = vim.fn.expand '%:p'
+  local root = find_notebook_root(here)
+  if not root then
+    return vim.notify('ZK: notebook root not found.', vim.log.levels.ERROR)
+  end
+  local w = wikilink_at_cursor()
+  if not w or should_ignore_target(w.target) then
+    return
+  end
+
+  local path_part, anchor = split_anchor(w.target)
+  local here_dir = dirname(here)
+  local target_no_ext = path_part:gsub('%.md$', '')
+
+  -- Directory links: explicit trailing slash OR existing directory with that name
+  local candidate_dir = normalize_path(join(here_dir, target_no_ext))
+  if path_part:sub(-1) == '/' or vim.fn.isdirectory(candidate_dir) == 1 then
+    return open_directory(candidate_dir)
+  end
+
+  local found = find_existing(root, here_dir, target_no_ext)
+  if #found >= 1 then
+    if #found == 1 then
+      return open_file(found[1], { anchor = anchor, follow_mode = (opts and opts.follow_mode) })
+    end
+    local items = {}
+    for _, p in ipairs(found) do
+      items[#items + 1] = relpath(root, p)
+    end
+    local function pick_and_open()
+      local pick = vim.fn.inputlist(vim.list_extend({ 'Open note:' }, items))
+      if pick and items[pick] then
+        open_file(join(root, items[pick]), { anchor = anchor, follow_mode = (opts and opts.follow_mode) })
+      end
+    end
+    return vim.schedule(pick_and_open)
+  elseif anchor then
+    return vim.notify("Won't create anchor-only: file not found for [[" .. path_part .. '#' .. anchor .. ']]', vim.log.levels.WARN)
+  else
+    local default_title = w.alias or stem(path_part:match '([^/]+)$' or path_part):gsub('_', ' '):gsub('-', ' ')
+    return create_note_flow(root, here_dir, target_no_ext, default_title, opts or {})
+  end
+end
+
+function M.instant_create()
+  return M.follow_or_create { instant = true }
+end
+function M.follow_only()
+  return M.follow_or_create { follow_mode = 'file' }
+end
+function M.follow_jump_to_last_searched()
+  return M.follow_or_create { follow_mode = 'jump_to_last_search' }
+end
+
+-- ===================== UPDATE RELATED (inside fold) ============
+function M.update_links_section()
+  local buf = vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(buf)
+  if path == '' then
+    return
+  end
+  local root = find_notebook_root(path)
+  if not root then
+    return
+  end
+  local tags = list_note_tags(buf)
+
+  local n = vim.api.nvim_buf_line_count(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, n, false)
+  local region = find_nav_links_region(lines, M.cfg.backlinks.section_header, 1)
+  if not region or not region.open_delim then
+    return vim.notify('Navigation Links section not found; create it first.', vim.log.levels.WARN)
+  end
+
+  -- Remove existing "Related" subsection (from its header until next header or close delimiter)
+  local i = region.open_delim + 1
+  local rel_start, rel_end = nil, nil
+  while i <= (region.close_delim or n) do
+    if lines[i] and lines[i]:match('^###%s+' .. vim.pesc(M.cfg.backlinks.subsection_related)) then
+      rel_start = i
+      break
+    end
+    i = i + 1
+  end
+  if rel_start then
+    rel_end = (region.close_delim or n)
+    for j = rel_start + 1, (region.close_delim or n) do
+      if lines[j]:match '^###%s+' then
+        rel_end = j - 1
+        break
+      end
+      if trim(lines[j]) == M.cfg.backlinks.fold_delimiter then
+        rel_end = j - 1
+        break
+      end
+    end
+    vim.api.nvim_buf_set_lines(buf, rel_start - 1, rel_end, false, {}) -- remove header and its body
+  end
+
+  local related = scan_related_by_tags(root, path, tags or {})
+  if related and #related.list > 0 then
+    -- Insert "Related" just before the closing delimiter (or append if missing)
+    local close_at = region.close_delim and (region.close_delim - 1) or n
+    local ins = { '### ' .. M.cfg.backlinks.subsection_related }
+    for _, rel in ipairs(related.list) do
+      ins[#ins + 1] = ('[[%s|%s]]'):format(rel.wiki, rel.title)
+    end
+    ins[#ins + 1] = '' -- ensure blank line before the delimiter
+    vim.api.nvim_buf_set_lines(buf, close_at, close_at, false, ins)
+  end
+
+  fold_links_section(buf)
+end
+
+-- ===================== LINK UTILITIES =================
+local function all_wikilinks_in_buffer(buf)
+  buf = buf or 0
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local out = {}
+  for i, l in ipairs(lines) do
+    local start = 1
+    while true do
+      local s, e = l:find('%[%[[^%]]-%]%]', start)
+      if not s then
+        break
+      end
+      local inner = l:sub(s + 2, e - 2)
+      local tgt, alias = inner:match '^(.-)|(.+)$'
+      out[#out + 1] = { line = i, col = s - 1, target = trim(tgt or inner), alias = alias }
+      start = e + 1
+    end
+  end
+  return out
+end
+
+function M.links_picker()
+  local links = all_wikilinks_in_buffer(0)
+  if #links == 0 then
+    return vim.notify 'No wikilinks in buffer'
+  end
+  local items = {}
+  for _, L in ipairs(links) do
+    items[#items + 1] = string.format('%4d:%-3d  %s', L.line, L.col, L.alias and (L.alias .. ' -> ' .. L.target) or L.target)
+  end
+  local function pick()
+    local idx = vim.fn.inputlist(vim.list_extend({ 'Wikilinks:' }, items))
+    if idx and items[idx] then
+      local ln, cn = items[idx]:match '^%s*(%d+):(%d+)'
+      if ln then
+        vim.api.nvim_win_set_cursor(0, { tonumber(ln), tonumber(cn) })
+      end
+    end
+  end
+  vim.schedule(pick)
+end
+
+-- ===================== PREVIEWS ====================
+local function ensure_preview_for_path(path)
+  local it = M._previews.items[path]
+  if it and vim.api.nvim_buf_is_valid(it.buf) and (it.win and vim.api.nvim_win_is_valid(it.win)) then
+    return it
+  end
+  local buf = vim.fn.bufadd(path)
+  vim.fn.bufload(buf)
+  vim.bo[buf].bufhidden = 'hide'
+  vim.bo[buf].modifiable = true
+  if vim.bo[buf].filetype == '' then
+    vim.bo[buf].filetype = 'markdown'
+  end
+  local rec = { path = path, buf = buf, win = nil, pinned = false, centered = false }
+  M._previews.items[path] = rec
+  table.insert(M._previews.order, 1, path)
+  return rec
+end
+
+local function attach_preview_controls(buf, win)
+  local map = function(lhs, rhs, desc)
+    vim.keymap.set('n', lhs, rhs, { buffer = buf, silent = true, desc = desc })
+  end
+  local function adjust(delta_row, delta_col, delta_h, delta_w)
+    local cfg = vim.api.nvim_win_get_config(win)
+    cfg.row = math.max(0, (cfg.row or 0) + (delta_row or 0))
+    cfg.col = math.max(0, (cfg.col or 0) + (delta_col or 0))
+    cfg.height = math.max(4, (cfg.height or 12) + (delta_h or 0))
+    cfg.width = math.max(10, (cfg.width or 30) + (delta_w or 0))
+    vim.api.nvim_win_set_config(win, cfg)
+  end
+  local ms, rs = M.cfg.preview.move_step, M.cfg.preview.resize_step
+  map('h', function()
+    if M._previews.controls_enabled then
+      adjust(0, -ms, 0, 0)
+    else
+      feedkeys 'h'
+    end
+  end, 'Move left')
+  map('j', function()
+    if M._previews.controls_enabled then
+      adjust(ms, 0, 0, 0)
+    else
+      feedkeys 'j'
+    end
+  end, 'Move down')
+  map('k', function()
+    if M._previews.controls_enabled then
+      adjust(-ms, 0, 0, 0)
+    else
+      feedkeys 'k'
+    end
+  end, 'Move up')
+  map('l', function()
+    if M._previews.controls_enabled then
+      adjust(0, ms, 0, 0)
+    else
+      feedkeys 'l'
+    end
+  end, 'Move right')
+
+  map('<A-h>', function()
+    adjust(0, 0, 0, -rs)
+  end, 'Narrow')
+  map('<A-l>', function()
+    adjust(0, 0, 0, rs)
+  end, 'Widen')
+  map('<A-k>', function()
+    adjust(-rs, 0, -rs, 0)
+  end, 'Shorter (up)')
+  map('<A-j>', function()
+    adjust(rs, 0, rs, 0)
+  end, 'Taller (down)')
+
+  -- Convert float to split
+  map('<A-H>', function()
+    local path = vim.api.nvim_buf_get_name(buf)
+    vim.api.nvim_win_close(win, true)
+    vim.cmd('leftabove vsplit ' .. vim.fn.fnameescape(path))
+  end, 'Float -> left vsplit')
+  map('<A-L>', function()
+    local path = vim.api.nvim_buf_get_name(buf)
+    vim.api.nvim_win_close(win, true)
+    vim.cmd('vsplit ' .. vim.fn.fnameescape(path))
+  end, 'Float -> right vsplit')
+  map('<A-K>', function()
+    local path = vim.api.nvim_buf_get_name(buf)
+    vim.api.nvim_win_close(win, true)
+    vim.cmd('leftabove split ' .. vim.fn.fnameescape(path))
+  end, 'Float -> top split')
+  map('<A-J>', function()
+    local path = vim.api.nvim_buf_get_name(buf)
+    vim.api.nvim_win_close(win, true)
+    vim.cmd('split ' .. vim.fn.fnameescape(path))
+  end, 'Float -> bottom split')
+end
+
+local function open_preview_window(rec, cfg)
+  if rec.win and vim.api.nvim_win_is_valid(rec.win) then
+    return rec.win
+  end
+  local opts = {
+    relative = 'editor',
+    style = 'minimal',
+    border = M.cfg.preview.border,
+    width = cfg.width,
+    height = cfg.height,
+    row = cfg.row,
+    col = cfg.col,
+    noautocmd = true,
+  }
+  rec.win = vim.api.nvim_open_win(rec.buf, false, opts)
+  attach_preview_controls(rec.buf, rec.win)
+  return rec.win
+end
+
+local function apply_layout()
+  if M._previews.hidden then
+    return
+  end
+  local width = vim.o.columns
+  local height = vim.o.lines - (vim.o.cmdheight or 1)
+  local cnt = #M._previews.order
+  local row, col = 1, 2
+  local real_width = math.max(20, math.floor(width * M.cfg.preview.width))
+  local real_height = math.min(M.cfg.preview.height, height - 2)
+  for i = 1, cnt do
+    local path = M._previews.order[i]
+    local rec = M._previews.items[path]
+    local pos = { row = row, col = col, width = real_width, height = real_height }
+    rec.win = open_preview_window(rec, pos)
+    row = row + real_height + M.cfg.preview.stack_gap
+  end
+end
+
+local function preview_for_link_under_cursor()
+  if not M.cfg.preview.auto then
+    return
+  end
+  local here = vim.fn.expand '%:p'
+  local root = find_notebook_root(here)
+  if not root then
+    return
+  end
+  local here_dir = dirname(here)
+  local w = wikilink_at_cursor()
+  if not w or should_ignore_target(w.target) then
+    return
+  end
+  local path_part = (w.target:gsub('%.md$', ''))
+  local found = find_existing(root, here_dir, path_part)
+  if not found[1] then
+    return
+  end
+  local rec = ensure_preview_for_path(found[1])
+  open_preview_window(rec, { row = 1, col = 2, width = math.floor(vim.o.columns * M.cfg.preview.width), height = M.cfg.preview.height })
+  apply_layout()
+end
+
+-- Persistence of pinned previews per-note
+local function state_file_for(root)
+  return join(root, '.zk', 'preview_layouts.json')
+end
+local function load_state(root)
+  local p = state_file_for(root)
+  if vim.fn.filereadable(p) == 0 then
+    return {}
+  end
+  local ok, decoded = pcall(vim.fn.json_decode, table.concat(vim.fn.readfile(p), '\n'))
+  return ok and (decoded or {}) or {}
+end
+local function save_state(root, data)
+  ensure_dir(join(root, '.zk'))
+  pcall(vim.fn.writefile, { vim.fn.json_encode(data) }, state_file_for(root))
+end
+
+local function save_preview_state_for_current_note()
+  if not M.cfg.preview.persist then
+    return
+  end
+  local note = vim.fn.expand '%:p'
+  local root = find_notebook_root(note)
+  if not root then
+    return
+  end
+  local state = load_state(root)
+  state[note] = state[note] or { pinned = {} }
+  state[note].pinned = {}
+  for _, rec in pairs(M._previews.items) do
+    if rec.pinned and rec.win and vim.api.nvim_win_is_valid(rec.win) then
+      local cfg = vim.api.nvim_win_get_config(rec.win)
+      table.insert(state[note].pinned, {
+        path = rec.path,
+        row = cfg.row,
+        col = cfg.col,
+        width = cfg.width,
+        height = cfg.height,
+      })
+    end
+  end
+  save_state(root, state)
+end
+
+local function restore_preview_state_for_current_note(buf)
+  if not M.cfg.preview.persist then
+    return
+  end
+  local note = vim.api.nvim_buf_get_name(buf)
+  local root = find_notebook_root(note)
+  if not root then
+    return
+  end
+  local state = load_state(root)
+  local S = state[note]
+  if not (S and S.pinned and #S.pinned > 0) then
+    return
+  end
+  for _, rec in ipairs(S.pinned) do
+    local R = ensure_preview_for_path(rec.path)
+    R.pinned = true
+    open_preview_window(R, { row = rec.row or 1, col = rec.col or 2, width = rec.width or 40, height = rec.height or 12 })
+  end
+  apply_layout()
+end
+
+function M.toggle_preview_auto()
+  M.cfg.preview.auto = not M.cfg.preview.auto
+  vim.notify('ZK Preview auto-peek: ' .. (M.cfg.preview.auto and 'ON' or 'OFF'))
+end
+function M.toggle_preview_layout()
+  M.cfg.preview.layout = (M.cfg.preview.layout == 'topleft') and 'bottomright' or 'topleft'
+  apply_layout()
+end
+function M.toggle_preview_hide_show()
+  M._previews.hidden = not M._previews.hidden
+  if M._previews.hidden then
+    for _, rec in pairs(M._previews.items) do
+      if rec.win and vim.api.nvim_win_is_valid(rec.win) then
+        vim.api.nvim_win_hide(rec.win)
+      end
+    end
+  else
+    apply_layout()
+  end
+end
+function M.toggle_preview_controls()
+  M._previews.controls_enabled = not M._previews.controls_enabled
+  vim.notify('ZK Preview move/resize: ' .. (M._previews.controls_enabled and 'ENABLED' or 'DISABLED'))
+end
+function M.pin_current_preview()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_get_buf(win)
+  for _, rec in pairs(M._previews.items) do
+    if rec.buf == buf and win == rec.win then
+      rec.pinned = not rec.pinned
+      vim.notify('ZK Preview pin: ' .. (rec.pinned and 'ON' or 'OFF'))
+      apply_layout()
+      return
+    end
+  end
+  vim.notify 'Not in a ZK preview window'
+end
+
+-- ===================== HISTORY PICKER ==========================
+function M.history_picker()
+  if #M._history == 0 then
+    return vim.notify 'ZK history is empty'
+  end
+  local items = {}
+  for _, it in ipairs(M._history) do
+    items[#items + 1] = { display = os.date('%Y-%m-%d %H:%M', it.ts) .. '  ' .. it.path, path = it.path }
+  end
+  local function pick()
+    local list = { 'Recent ZK jumps:' }
+    for _, it in ipairs(items) do
+      list[#list + 1] = it.display
+    end
+    local idx = vim.fn.inputlist(list)
+    if idx and idx > 0 and items[idx] then
+      open_file(items[idx].path)
+    end
+  end
+  vim.schedule(pick)
+end
+
+-- ===================== COMPLETION (blink.cmp provider) =================
+local function inside_wikilink_ctx(line, col)
+  local left = line:sub(1, col)
+  local open = left:match '()%[%[[^%]]*$'
+  if not open then
+    return nil
+  end
+  return left:sub(open + 1):gsub('^%s+', ''):gsub('|.*$', '')
+end
+
+local function list_rel_candidates(root, here_dir, prefix)
+  -- Sanitize prefix to a directory
+  local dir = select(1, resolve_dir_and_basename(root, here_dir, prefix))
+  local base_dir = normalize_path(dir)
+  local results = {}
+  local function emit(p, is_dir)
+    local rel = rel_wiki_path(here_dir, p)
+    if is_dir then
+      rel = rel .. '/'
+    end
+    results[#results + 1] = { label = rel, insert_text = rel, kind = is_dir and 19 or 17, detail = is_dir and 'Folder' or 'Note' }
+  end
+  if vim.fn.isdirectory(base_dir) == 1 then
+    for _, d in ipairs(vim.fn.globpath(base_dir, '*/', false, true)) do
+      emit(d, true)
+    end
+    for _, f in ipairs(vim.fn.globpath(base_dir, '*.md', false, true)) do
+      emit(f, false)
+    end
+  end
+  return results
+end
+
+local ProviderClass = {}
+ProviderClass.__index = ProviderClass
+function ProviderClass.new()
+  return setmetatable({}, ProviderClass)
+end
+function ProviderClass:is_available(ctx)
+  local buf = ctx and ctx.buf or vim.api.nvim_get_current_buf()
+  return vim.bo[buf].filetype == 'markdown'
+end
+function ProviderClass:get_trigger_characters()
+  return { '[', '/', '.', '-' }
+end
+function ProviderClass:get_completions(ctx, cb)
+  local function run()
+    local buf = (ctx and ctx.buf) or vim.api.nvim_get_current_buf()
+    local row, col
+    if ctx and ctx.row and ctx.col then
+      row, col = ctx.row, ctx.col
+    else
+      local p = vim.api.nvim_win_get_cursor(0)
+      row = p[1] - 1
+      col = p[2]
+    end
+    local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ''
+    local prefix = inside_wikilink_ctx(line, col)
+    if not prefix then
+      return cb { is_incomplete = false, items = {} }
+    end
+    local here = vim.api.nvim_buf_get_name(buf)
+    local root = find_notebook_root(here)
+    if not root then
+      return cb { is_incomplete = false, items = {} }
+    end
+    local here_dir = dirname(here)
+    cb { is_incomplete = false, items = list_rel_candidates(root, here_dir, prefix) }
+  end
+  -- Schedule to avoid Treesitter "yield across C-call boundary" during conceal updates
+  vim.schedule(run)
+end
+
+package.loaded['zk_follow_create.completion'] = {
+  new = function()
+    return ProviderClass.new()
+  end,
+}
+
+-- ===================== MAPPINGS / SETUP =======================
+local function on_enter_expr()
+  local w = wikilink_at_cursor()
+  if w then
+    vim.schedule(function()
+      M.follow_or_create()
+    end)
+    return ''
+  end
+  return '\r'
+end
+
+local function register_which_key()
+  local ok, wk = pcall(require, 'which-key')
+  if ok then
+    wk.add { { '<leader>z', group = 'ZK' } }
+  end
+end
+
+local function configure_undo_dirs()
+  if not M.cfg.use_hashed_undodir then
+    return
+  end
+  local dir = M.cfg.undodir
+  if not dir:match '//$' then
+    dir = dir .. '//'
+  end
+  ensure_dir(dir:gsub('//$', ''))
+  vim.opt.undofile = true
+  vim.opt.undodir = dir
+end
+
+function M.setup(user_cfg)
+  if type(user_cfg) == 'table' then
+    M.cfg = vim.tbl_deep_extend('force', M.cfg, user_cfg)
+  end
+  configure_undo_dirs()
+
+  local grp = vim.api.nvim_create_augroup('zk_follow_create', { clear = true })
+
+  vim.api.nvim_create_autocmd('FileType', {
+    group = grp,
+    pattern = 'markdown',
+    callback = function(args)
+      local buf = args.buf
+      if M.cfg.map_enter then
+        vim.keymap.set(
+          'n',
+          '<CR>',
+          (function()
+            return on_enter_expr
+          end)(),
+          { buffer = buf, expr = true, desc = 'ZK: follow/create [[link]]' }
+        )
+      end
+      if M.cfg.map_namespace then
+        vim.keymap.set('n', '<leader>zf', function()
+          require('zk_follow_create').follow_or_create()
+        end, { buffer = buf, desc = 'ZK: follow/create link' })
+        vim.keymap.set('n', '<leader>zF', function()
+          require('zk_follow_create').instant_create()
+        end, { buffer = buf, desc = 'ZK: instant create' })
+        vim.keymap.set('n', '<leader>zo', function()
+          require('zk_follow_create').follow_only()
+        end, { buffer = buf, desc = 'ZK: open linked note' })
+        vim.keymap.set('n', '<leader>zJ', function()
+          require('zk_follow_create').follow_jump_to_last_searched()
+        end, { buffer = buf, desc = 'ZK: follow + jump to last /' })
+
+        vim.keymap.set('n', '<leader>zh', function()
+          require('zk_follow_create').history_picker()
+        end, { buffer = buf, desc = 'ZK: history' })
+        vim.keymap.set('n', '<leader>zL', function()
+          require('zk_follow_create').links_picker()
+        end, { buffer = buf, desc = 'ZK: list wikilinks' })
+        vim.keymap.set('n', '<leader>zU', function()
+          require('zk_follow_create').update_links_section()
+        end, { buffer = buf, desc = 'ZK: update Related links' })
+
+        vim.keymap.set('n', '<leader>zp', function()
+          require('zk_follow_create').toggle_preview_auto()
+        end, { buffer = buf, desc = 'ZK Preview: auto-peek' })
+        vim.keymap.set('n', '<leader>zP', function()
+          require('zk_follow_create').pin_current_preview()
+        end, { buffer = buf, desc = 'ZK Preview: pin/unpin' })
+        vim.keymap.set('n', '<leader>zH', function()
+          require('zk_follow_create').toggle_preview_hide_show()
+        end, { buffer = buf, desc = 'ZK Preview: hide/show' })
+        vim.keymap.set('n', '<leader>zA', function()
+          require('zk_follow_create').toggle_preview_layout()
+        end, { buffer = buf, desc = 'ZK Preview: toggle layout' })
+        vim.keymap.set('n', M.cfg.preview.controls_toggle, function()
+          require('zk_follow_create').toggle_preview_controls()
+        end, { buffer = buf, desc = 'ZK Preview: move/resize toggle' })
+
+        -- Insert [[./]] helper
+        vim.keymap.set('n', M.cfg.map_insert_relative, function()
+          vim.api.nvim_put({ '[[./]]' }, 'c', true, true)
+          feedkeys '<Left><Left>' -- cursor after /
+          vim.cmd 'startinsert'
+        end, { buffer = buf, desc = 'ZK: insert [[./]] and trigger completion' })
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd('CursorHold', {
+    group = grp,
+    pattern = 'markdown',
+    callback = function()
+      if M.cfg.preview.auto then
+        preview_for_link_under_cursor()
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd('BufReadPost', {
+    group = grp,
+    pattern = '*.md',
+    callback = function(args)
+      if M.cfg.folds.frontmatter then
+        fold_frontmatter(args.buf)
+      end
+      if M.cfg.virt_tags.enabled then
+        show_tags_virttext(args.buf)
+      end
+      if M.cfg.folds.links then
+        fold_links_section(args.buf)
+      end
+      if M.cfg.preview.persist then
+        restore_preview_state_for_current_note(args.buf)
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd({ 'BufLeave', 'VimLeavePre' }, {
+    group = grp,
+    pattern = '*.md',
+    callback = function()
+      save_preview_state_for_current_note()
+    end,
+  })
+
+  register_which_key()
+end
+
+return M
